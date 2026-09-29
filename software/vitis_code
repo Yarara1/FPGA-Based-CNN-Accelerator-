@@ -1,0 +1,287 @@
+#include "platform.h"
+#include "xil_printf.h"
+#include "xil_io.h"
+#include "xil_cache.h"
+#include "xparameters.h"
+#include <stdint.h>
+
+#include "input_data.h"
+#include "conv1_w.h"
+#include "conv2_w.h"
+#include "fc_w.h"
+#include "expected_output.h"
+
+/* ===== PL Memory Base Addresses ===== */
+#define IMEM_BASE     XPAR_IN_IMAGE_BASEADDR
+#define CONV1_W_BASE  XPAR_CONV1_W_BASEADDR
+#define CONV2_W_BASE  XPAR_CONV2_W_BASEADDR
+#define FC_W_BASE     XPAR_FC_W_BASEADDR
+#define CSR_BASE      XPAR_CSR_0_BASEADDR
+#define FC_OUT_BASE   0xC8000000U
+
+/* ===== CSR Register Map ===== */
+#define CSR_CTRL        0x00U
+#define CSR_STATUS      0x04U
+#define CSR_TIMER_VALUE 0x08U
+#define CSR_DEBUG_STATE 0x0CU
+#define CTRL_START        (1U << 0)
+#define CTRL_TIMER_START  (1U << 1)
+#define CTRL_TIMER_STOP   (1U << 2)
+#define CTRL_CLEAR        (1U << 3)
+#define STATUS_DONE_BIT   0x1U
+
+/* Data lengths */
+#define NUM_IMAGES    10000U
+#define CONV1_W_LEN   72U
+#define CONV2_W_LEN   1152U
+#define FC_W_LEN      23040U
+#define IMAGE_LEN     784U
+#define NUM_CLASSES   10U
+#define PRINT_EVERY   5000U
+#define POLL_TIMEOUT  2000000000U
+#define POLL_HEARTBEAT 100000000U
+
+/* =========================================================
+ * Core control
+ * ========================================================= */
+static void do_reset(void)
+{
+    int i;
+    /* 3 writes: enough to hold soft_reset HIGH for ~3 AXI cycles
+     * More reliable than 1 write, faster than 10              */
+    for (i = 0; i < 1; i++)
+        Xil_Out32(CSR_BASE + CSR_CTRL, CTRL_CLEAR);
+    Xil_Out32(CSR_BASE + CSR_CTRL, 0U);
+}
+
+static void core_start(void)
+{
+    int i;
+    /* 2 writes: enough for FSM to sample start=1 reliably
+     * Reduced from 11 → saves 9 × 3.5µs = 31.5µs per image
+     * = 315ms over 10000 images                              */
+    for (i = 0; i < 1; i++)
+        Xil_Out32(CSR_BASE + CSR_CTRL, CTRL_START);
+    Xil_Out32(CSR_BASE + CSR_CTRL, 0U);
+}
+
+static void timer_start(void)
+{
+    int i;
+    for (i = 0; i < 1; i++)
+        Xil_Out32(CSR_BASE + CSR_CTRL, CTRL_TIMER_START);
+    Xil_Out32(CSR_BASE + CSR_CTRL, 0U);
+}
+
+static void timer_stop(void)
+{
+    int i;
+    for (i = 0; i < 1; i++)
+        Xil_Out32(CSR_BASE + CSR_CTRL, CTRL_TIMER_STOP);
+    Xil_Out32(CSR_BASE + CSR_CTRL, 0U);
+}
+
+/* =========================================================
+ * Image transfer: CPU loop DRAM -> PL image BRAM
+ * With D-cache enabled, flush after writing to ensure
+ * data reaches PL BRAM and is not stuck in cache.
+ * ========================================================= */
+static void send_one_image_to_pl(u32 img_idx)
+{
+    const int8_t *img_ptr = &input_data[img_idx * IMAGE_LEN];
+    u32 j;
+    for (j = 0; j < IMAGE_LEN; j++)
+        Xil_Out32(IMEM_BASE + j * 4U, (u32)(s32)(int8_t)img_ptr[j]);
+
+    /* Flush D-cache to ensure all writes reached PL BRAM
+     * If IMEM_BASE is outside cache range this is a no-op  */
+    Xil_DCacheFlushRange(IMEM_BASE, IMAGE_LEN * 4U);
+}
+
+/* =========================================================
+ * Weight transfer: DRAM -> PL BRAMs (once per run)
+ * ========================================================= */
+static void send_weights_to_pl(void)
+{
+    u32 i;
+    xil_printf("\n\r[WEIGHT] Transferring weights...\n\r");
+    for (i = 0; i < CONV1_W_LEN; i++)
+        Xil_Out32(CONV1_W_BASE + i*4U, (u32)(s32)(int8_t)conv1_w[i]);
+    for (i = 0; i < CONV2_W_LEN; i++)
+        Xil_Out32(CONV2_W_BASE + i*4U, (u32)(s32)(int8_t)conv2_w[i]);
+    for (i = 0; i < FC_W_LEN; i++)
+        Xil_Out32(FC_W_BASE + i*4U, (u32)(s32)(int8_t)fc_w[i]);
+
+    /* Flush to ensure all weight writes reached PL BRAMs */
+    Xil_DCacheFlush();
+
+    xil_printf("[WEIGHT] Done. Total=%d writes\n\r",
+               (int)(CONV1_W_LEN + CONV2_W_LEN + FC_W_LEN));
+}
+
+/* =========================================================
+ * Read 10 logits from fc_out BRAM, return argmax digit
+ * ========================================================= */
+static int read_fc_out(s32 *max_logit_out)
+{
+    s32 max_val   = (s32)Xil_In32(FC_OUT_BASE);
+    int predicted = 0;
+    int k;
+    for (k = 1; k < (int)NUM_CLASSES; k++) {
+        s32 val = (s32)Xil_In32(FC_OUT_BASE + (u32)k * 4U);
+        if (val > max_val) { max_val = val; predicted = k; }
+    }
+    *max_logit_out = max_val;
+    return predicted;
+}
+
+/* =========================================================
+ * Expected digit from golden label array
+ * ========================================================= */
+static int get_expected_digit(u32 img_idx)
+{
+    const int8_t *e = &expected_output[img_idx * NUM_CLASSES];
+    int best = 0;
+    int k;
+    for (k = 1; k < (int)NUM_CLASSES; k++)
+        if (e[k] > e[best]) best = k;
+    return best;
+}
+
+/* =========================================================
+ * Debug: print STATUS on timeout
+ * ========================================================= */
+static void debug_poll_status(u32 img_idx)
+{
+    int i;
+    xil_printf("[DEBUG img=%d] STATUS samples:\n\r", (int)img_idx);
+    for (i = 0; i < 5; i++) {
+        xil_printf("  STATUS=0x%08X  STATE=0x%08X\n\r",
+                   (unsigned)Xil_In32(CSR_BASE + CSR_STATUS),
+                   (unsigned)Xil_In32(CSR_BASE + CSR_DEBUG_STATE));
+        for (volatile int d = 0; d < 500000; d++);
+    }
+}
+
+/* =========================================================
+ * main
+ * ========================================================= */
+int main(void)
+{
+    u32 img_idx;
+    u32 correct_count = 0U;
+    u32 wrong_count   = 0U;
+    u32 timeout_count = 0U;
+
+    init_platform();
+    Xil_ICacheEnable();
+    Xil_DCacheEnable();   /* Enable D-cache for faster DDR3 reads */
+
+    xil_printf("\n\r========================================\n\r");
+    xil_printf(" CNN Accelerator - %d images\n\r", (int)NUM_IMAGES);
+    xil_printf("========================================\n\r");
+    xil_printf("[INFO] IMEM_BASE   = 0x%08X\n\r", (unsigned)IMEM_BASE);
+    xil_printf("[INFO] FC_OUT_BASE = 0x%08X\n\r", (unsigned)FC_OUT_BASE);
+    xil_printf("[INFO] NUM_IMAGES  = %d\n\r",     (int)NUM_IMAGES);
+    xil_printf("[INFO] PRINT_EVERY = %d\n\r",     (int)PRINT_EVERY);
+
+    /* Double reset */
+    xil_printf("\n\r[RESET] Double reset...\n\r");
+    do_reset();
+    do_reset();
+    xil_printf("[RESET] Done\n\r");
+
+    xil_printf("\n\r[TIMER] Start\n\r");
+    timer_start();
+
+    /* 1. Send weights once */
+    send_weights_to_pl();
+
+    xil_printf("\n\r[IMAGE] Processing %d images...\n\r", (int)NUM_IMAGES);
+
+    for (img_idx = 0U; img_idx < NUM_IMAGES; img_idx++) {
+
+        /* Send image via CPU loop + cache flush */
+        send_one_image_to_pl(img_idx);
+
+        /* Pulse start */
+        core_start();
+
+        /* Poll until done or timeout */
+        {
+            u32 status    = 0U;
+            u32 timeout   = POLL_TIMEOUT;
+            u32 heartbeat = POLL_HEARTBEAT;
+
+            while (!((status = Xil_In32(CSR_BASE + CSR_STATUS))
+                     & STATUS_DONE_BIT)) {
+                if (--timeout == 0U) {
+                    xil_printf("[ERROR] TIMEOUT img=%d STATUS=0x%08X\n\r",
+                               (int)img_idx, (unsigned)status);
+                    debug_poll_status(img_idx);
+                    timeout_count++;
+                    break;
+                }
+                if (--heartbeat == 0U) {
+                    heartbeat = POLL_HEARTBEAT;
+                    xil_printf("[IMAGE %d] running... cycles=%d\n\r",
+                               (int)img_idx,
+                               (int)(POLL_TIMEOUT - timeout));
+                }
+            }
+            if (timeout == 0U) { do_reset(); continue; }
+        }
+
+        /* Read results */
+        {
+            s32 max_logit = 0;
+            int predicted = read_fc_out(&max_logit);
+            int expected  = get_expected_digit(img_idx);
+
+            if (predicted == expected) correct_count++;
+            else                       wrong_count++;
+
+            if (((img_idx % PRINT_EVERY) == 0U) ||
+                (predicted != expected)) {
+                u32 t = Xil_In32(CSR_BASE + CSR_TIMER_VALUE);
+                xil_printf("[IMAGE %5d] pred=%d exp=%d logit=%4d %-7s"
+                           " acc=%d/%d t=%dms\n\r",
+                           (int)img_idx, predicted, expected,
+                           (int)max_logit,
+                           (predicted==expected)?"CORRECT":"WRONG",
+                           (int)correct_count,
+                           (int)(img_idx+1U), (int)t);
+            }
+        }
+
+        /* Reset between images */
+        do_reset();
+    }
+
+    /* Final results */
+    Xil_DCacheFlush();   /* Flush before stopping timer */
+    timer_stop();
+    {
+        u32 total_ms = Xil_In32(CSR_BASE + CSR_TIMER_VALUE);
+        xil_printf("\n\r========================================\n\r");
+        xil_printf(" FINAL RESULT\n\r");
+        xil_printf("========================================\n\r");
+        xil_printf("Total images  : %d\n\r",  (int)NUM_IMAGES);
+        xil_printf("Correct       : %d\n\r",  (int)correct_count);
+        xil_printf("Wrong         : %d\n\r",  (int)wrong_count);
+        xil_printf("Timeout       : %d\n\r",  (int)timeout_count);
+        xil_printf("Accuracy      : %d.%02d%%\n\r",
+                   (int)(correct_count * 100U  / NUM_IMAGES),
+                   (int)(correct_count * 10000U / NUM_IMAGES % 100U));
+        xil_printf("Elapsed       : %d ms\n\r",  (int)total_ms);
+        xil_printf("Avg/image     : %d ms\n\r",
+                   (int)(total_ms / NUM_IMAGES));
+        xil_printf("Total writes  : %d\n\r",
+                   (int)(NUM_IMAGES * IMAGE_LEN
+                         + CONV1_W_LEN + CONV2_W_LEN + FC_W_LEN));
+        xil_printf("========================================\n\r");
+    }
+
+    cleanup_platform();
+    return 0;
+}
