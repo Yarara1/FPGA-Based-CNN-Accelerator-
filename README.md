@@ -30,7 +30,10 @@ Argmax prediction.
 The accelerator is controlled by a **MicroBlaze soft-core processor**
 through an AXI-based interface. Input images, trained weights, intermediate
 feature maps, and output logits are stored in dedicated BRAM memories.
-<img width="1053" height="514" alt="image" src="https://github.com/user-attachments/assets/d06cebe6-4df3-48ea-8676-0b7d565e226f" />
+<img width="1193" height="662" alt="image" src="https://github.com/user-attachments/assets/617a0788-1307-4b03-b856-ebc83acd49ae" />
+<img width="1198" height="662" alt="image" src="https://github.com/user-attachments/assets/8cf75be9-3810-4cfb-a459-d85ade761638" />
+
+
 ## Hardware Architecture
 
 ### Conv1
@@ -42,7 +45,8 @@ A custom **MMU_pipe9** datapath performs nine multiplications in parallel
 using DSP resources. The MAC operation is divided into a 6-stage pipeline
 to reduce the critical path.
 
-<img width="1074" height="591" alt="image" src="https://github.com/user-attachments/assets/6b220ced-a4eb-4009-bf75-7a2db5700674" />
+<img width="1183" height="500" alt="image" src="https://github.com/user-attachments/assets/5ad3a3c5-5c21-42ef-9546-29238f1f4a3f" />
+
 
 
 ### Conv2
@@ -59,7 +63,7 @@ To increase throughput:
 - Weights are preloaded locally before computation.
 - Computation is divided into two input-channel passes.
 
-<img width="1088" height="604" alt="image" src="https://github.com/user-attachments/assets/eb59ca53-175d-486f-902b-51d7baa33ac0" />
+<img width="1181" height="488" alt="image" src="https://github.com/user-attachments/assets/a5485949-1f82-4896-a5bd-31325663787b" />
 
 
 ### Pipelined MAC Units
@@ -72,7 +76,7 @@ Two custom multiply-accumulate architectures were implemented:
 The pipelined adder-tree architecture reduces the combinational critical
 path and enabled timing closure at 100 MHz.
 
-<img width="1077" height="598" alt="image" src="https://github.com/user-attachments/assets/aa51906f-3277-4840-bc2a-5ed9f088a9a5" />
+<img width="1189" height="477" alt="image" src="https://github.com/user-attachments/assets/d7515215-0dda-4410-b8d7-7bfe6e12f945" />
 
 
 ## Memory Architecture
