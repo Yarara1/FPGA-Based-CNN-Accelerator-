@@ -1,0 +1,27 @@
+# Vivado generated files
+.Xil/
+*.jou
+*.log
+*.str
+*.pb
+*.wdb
+
+.cache/
+.gen/
+.hw/
+.ip_user_files/
+.runs/
+.sim/
+
+# Vitis generated files
+Debug/
+Release/
+
+# Temporary/editor files
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Backup files
+*~
+*.bak
