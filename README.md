@@ -141,7 +141,7 @@ Simulation produced bit-exact agreement with the expected output logits.
 
 ## Results
 
-![Results](docs/results.png)
+<img width="641" height="334" alt="image" src="https://github.com/user-attachments/assets/3ad2a707-f96f-4c58-953b-aefc76ce38ff" />
 
 The final hardware implementation classified all **10,000 MNIST test
 images correctly**.
@@ -168,7 +168,8 @@ The design achieved timing closure at **100 MHz**:
 | BRAM | 27 | 20.00% |
 | DSP | 159 | 66.25% |
 
-![Resource Utilization](docs/resource_utilization.png)
+<img width="1193" height="664" alt="image" src="https://github.com/user-attachments/assets/19ae5f71-6653-4ba1-b957-5d2c85ae0c1f" />
+
 
 ## Design Optimizations
 
