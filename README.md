@@ -1,4 +1,4 @@
-# FPGA-Based-CNN-Accelerator-
+
 # FPGA-Based CNN Accelerator for MNIST Classification
 
 An FPGA-based convolutional neural network accelerator implemented on the
